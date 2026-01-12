@@ -1,0 +1,46 @@
+# NetBox Proxmox Sync Configuration
+# Copy this file to config.ini and fill in your values
+
+[proxmox]
+# Proxmox host (IP or FQDN)
+host = proxmox.example.com
+
+# Proxmox user (format: username@realm, e.g. root@pam)
+user = root@pam
+
+# Proxmox API token name
+token = my-token-name
+
+# Proxmox API token secret
+secret = xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+
+[netbox]
+# NetBox URL (with http:// or https://)
+url = https://netbox.example.com
+
+# NetBox API token (minimum 40 characters)
+token = abcdefghijklmnopqrstuvwxyz0123456789abcd
+
+# Name of Proxmox cluster in NetBox
+cluster_name = proxmox-prod
+
+[opnsense]
+# OPNsense URL for ARP lookup (optional)
+# If empty/not present: ARP lookup is disabled
+url = https://opnsense.example.com
+
+# OPNsense API key
+key = your-api-key
+
+# OPNsense API secret
+secret = your-api-secret
+
+[general]
+# SSL verification (false for self-signed certificates)
+verify_ssl = false
+
+# Request timeout in seconds
+request_timeout = 10
+
+# Number of retry attempts on errors
+retry_count = 3
