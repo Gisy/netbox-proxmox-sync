@@ -2,6 +2,7 @@
 config.ini
 .env
 .env.local
+.archive
 
 # Python
 __pycache__/
