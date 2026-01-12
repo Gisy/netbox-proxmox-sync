@@ -1,46 +1,46 @@
 # NetBox Proxmox Sync Configuration
-# Copy this file to config.ini and fill in your values
+# Syncs Proxmox VMs and Containers to NetBox with optional port scanning
 
 [proxmox]
-# Proxmox host (IP or FQDN)
-host = proxmox.example.com
+# Proxmox API credentials
+pve_host = pve.example.com
+pve_user = sync@pam
+pve_password = your_password
+pve_verify_ssl = False
 
-# Proxmox user (format: username@realm, e.g. root@pam)
-user = root@pam
-
-# Proxmox API token name
-token = my-token-name
-
-# Proxmox API token secret
-secret = xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+# NetBox site name for Proxmox cluster
+netbox_site = Datacenter
 
 [netbox]
-# NetBox URL (with http:// or https://)
+# NetBox API credentials
 url = https://netbox.example.com
+token = your_api_token_here
+ssl_verify = True
 
-# NetBox API token (minimum 40 characters)
-token = abcdefghijklmnopqrstuvwxyz0123456789abcd
+[sync]
+# Synchronization options
+enabled = True
+# Interval in seconds (3600 = 1 hour)
+interval = 3600
+# Dry run mode (log changes without applying them)
+dry_run = False
 
-# Name of Proxmox cluster in NetBox
-cluster_name = proxmox-prod
+[port_scanning]
+# Port scanning feature - auto-detect open ports and add as services
+enabled = False
+# Ports to scan (comma-separated, ranges with dash, e.g. "22,80,443,3000-3100,8080-8090")
+ports_to_scan = 22,80,443,3306,5432,8080,8443
+# Socket timeout per port in seconds
+timeout = 5
+# Max parallel threads for scanning
+max_threads = 20
 
-[opnsense]
-# OPNsense URL for ARP lookup (optional)
-# If empty/not present: ARP lookup is disabled
-url = https://opnsense.example.com
-
-# OPNsense API key
-key = your-api-key
-
-# OPNsense API secret
-secret = your-api-secret
-
-[general]
-# SSL verification (false for self-signed certificates)
-verify_ssl = false
-
-# Request timeout in seconds
-request_timeout = 10
-
-# Number of retry attempts on errors
-retry_count = 3
+[logging]
+# Log level: DEBUG, INFO, WARNING, ERROR
+level = INFO
+# Log file path (leave empty for console only)
+file = netbox-sync.log
+# Max log file size in MB
+max_size = 10
+# Number of backup log files
+backup_count = 5

@@ -1,212 +1,198 @@
 #!/usr/bin/env python3
-"""
-NetBox ↔ Proxmox Sync - Synchronize VMs and Containers with MAC-to-IP Matching
 
-Features:
-  - Synchronize VMs and containers from Proxmox to NetBox
-  - Automatic MAC address mapping
-  - IP addresses via OPNsense ARP lookup
-  - Interface management (ethX, MAC, IP)
-  - Status synchronization
-  - Dry-run mode with ethX/MAC/IP mapping
-  
-Usage:
-  ./netbox-sync.py              # Normal sync with ARP lookup
-  ./netbox-sync.py --dry-run    # Only log, no changes
-  ./netbox-sync.py --no-arp     # Without OPNsense ARP lookup
+"""
+NetBox ↔ Proxmox Sync - mit MAC-to-IP Matching über OPNsense ARP + Port Scanning
+
+Synchronisiert VMs und Container mit Status + IPs via DHCP/ARP-Lookup
++ Optional: Port Scanning und Service-Erstellung in NetBox
++ Dry-Run ethX/MAC/IP-Mapping
 """
 
 import sys
 import logging
-import argparse
+import configparser
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 
-from common import (
-    load_config,
-    validate_config,
-    get_session,
-    get_headers,
-    setup_logging,
-    make_api_request,
-    __version__,
-)
-from nb_vm import get_or_create_vm, get_or_create_cluster
 from nb_interfaces import ensure_vm_interface_with_mac
 from nb_ip import ensure_ip_on_interface_and_vm
+from nb_vm import get_or_create_vm
+import requests
+from proxmoxer import ProxmoxAPI
 
-try:
-    from proxmoxer import ProxmoxAPI
-except ImportError:
-    print("❌ proxmoxer not installed. Install with: pip install -r requirements.txt")
-    sys.exit(1)
-
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
+DRY_RUN = True  # aktuell NUR Logging der Zuordnung, keine NetBox-Änderungen
 
-class NetBoxProxmoxSync:
-    """Main class for Proxmox → NetBox synchronization"""
+
+def load_config() -> Dict:
+    """Lade Konfiguration aus config.ini"""
+    config_file = Path(__file__).parent / 'config.ini'
+    if not config_file.exists():
+        logger.error(f"Config nicht gefunden: {config_file}")
+        sys.exit(1)
     
-    def __init__(self, config: Dict, dry_run: bool = False, use_arp: bool = True):
-        """
-        Initialize syncer
-        
-        Args:
-            config: Configuration from load_config()
-            dry_run: Only log, no changes
-            use_arp: Enable OPNsense ARP lookup
-        """
-        self.config = config
-        self.dry_run = dry_run
-        self.use_arp = use_arp
-        self.session = get_session(verify_ssl=config['VERIFY_SSL'])
-        self.opn_session = None
-        
-        if self.use_arp and config['OPNSENSE_URL'] and config['OPNSENSE_KEY']:
-            self.opn_session = get_session(verify_ssl=config['VERIFY_SSL'])
-            self.opn_session.auth = (config['OPNSENSE_KEY'], config['OPNSENSE_SECRET'])
-            logger.info("✅ OPNsense ARP lookup enabled\n")
-        else:
-            if self.use_arp:
-                logger.warning("⚠️ OPNsense ARP lookup disabled (config incomplete)\n")
+    config = configparser.ConfigParser()
+    config.read(config_file)
     
-    def extract_disk_size(self, disk_str: str) -> int:
-        """Extract disk size from disk string (in GB)"""
-        try:
-            if 'size=' in disk_str:
-                size_part = disk_str.split('size=')[1].split(',')[0]
-                if size_part.endswith('G'):
-                    return int(size_part[:-1])
-                elif size_part.endswith('M'):
-                    return int(size_part[:-1]) // 1024
-                elif size_part.endswith('T'):
-                    return int(size_part[:-1]) * 1024
-        except Exception as e:
-            logger.debug(f"Disk parse error: {e}")
-        
-        return 0
-    
-    def get_vm_mac(self, vm_config: Dict, net_index: int) -> Optional[str]:
-        """Get MAC address from VM/Container config for netX"""
-        try:
-            net_key = f'net{net_index}'
-            if net_key not in vm_config:
-                return None
-            
-            net_str = vm_config[net_key]
-            
-            for part in net_str.split(','):
-                if '=' in part:
-                    _, mac_candidate = part.split('=', 1)
-                    mac_candidate = mac_candidate.strip()
-                    if len(mac_candidate) == 17 and mac_candidate.count(':') == 5:
-                        return mac_candidate.lower()
-        except Exception as e:
-            logger.debug(f"MAC parse error: {e}")
-        
-        return None
-    
-    def fetch_arp_map(self) -> Dict[str, str]:
-        """Fetch ARP table from OPNsense: MAC -> IP"""
-        if not self.opn_session:
-            return {}
-        
-        try:
-            url = f"{self.config['OPNSENSE_URL']}/api/diagnostics/interface/get_arp"
-            response = make_api_request(
-                self.opn_session,
-                "GET",
-                url,
-                {},
-                timeout=self.config['REQUEST_TIMEOUT'],
-                retry_count=self.config['RETRY_COUNT']
-            )
-            
-            if not response or response.status_code != 200:
-                logger.warning(f"⚠️ OPNsense ARP error: Status {response.status_code if response else 'N/A'}")
-                return {}
-            
-            data = response.json()
-            rows = data if isinstance(data, list) else data.get('rows', [])
-            
-            arp_map = {}
-            for row in rows:
-                ip = row.get('ip') or row.get('ipaddr')
-                mac = row.get('mac') or row.get('macaddr')
-                if ip and mac:
-                    arp_map[mac.lower()] = ip
-            
-            logger.debug(f"OPNsense ARP: {len(arp_map)} entries")
-            return arp_map
-        
-        except Exception as e:
-            logger.warning(f"⚠️ OPNsense ARP error: {e}")
-            return {}
-    
-    def get_ip_from_mac(self, mac: str, arp_map: Dict[str, str]) -> Optional[str]:
-        """Find IP address for MAC address from ARP table"""
-        if not mac or not arp_map:
+    return {
+        'PVE_HOST': config.get('proxmox', 'host'),
+        'PVE_USER': config.get('proxmox', 'user'),
+        'PVE_TOKEN': config.get('proxmox', 'token'),
+        'PVE_SECRET': config.get('proxmox', 'secret'),
+        'NB_URL': config.get('netbox', 'url'),
+        'NB_TOKEN': config.get('netbox', 'token'),
+        'CLUSTER_NAME': config.get('netbox', 'cluster_name'),
+        'OPNSENSE_URL': config.get('opnsense', 'url', fallback=''),
+        'OPNSENSE_KEY': config.get('opnsense', 'key', fallback=''),
+        'OPNSENSE_SECRET': config.get('opnsense', 'secret', fallback=''),
+        # Port Scanning (NEW)
+        'PORT_SCANNING_ENABLED': config.getboolean('port_scanning', 'enabled', fallback=False),
+        'PORT_SCANNING_PORTS': config.get('port_scanning', 'ports_to_scan', fallback='22,80,443'),
+        'PORT_SCANNING_TIMEOUT': config.getint('port_scanning', 'timeout', fallback=5),
+        'PORT_SCANNING_THREADS': config.getint('port_scanning', 'max_threads', fallback=20),
+    }
+
+
+config = load_config()
+
+requests.packages.urllib3.disable_warnings()
+session = requests.Session()
+session.verify = False
+
+# OPNsense Session falls vorhanden
+opn_session = None
+if config['OPNSENSE_URL'] and config['OPNSENSE_KEY']:
+    opn_session = requests.Session()
+    opn_session.auth = (config['OPNSENSE_KEY'], config['OPNSENSE_SECRET'])
+    opn_session.verify = False
+    logger.info("✅ OPNsense ARP-Lookup aktiviert\n")
+
+
+def extract_disk_size(disk_str: str) -> int:
+    """Extrahiere Festplattengröße aus Disk-String"""
+    try:
+        if 'size=' in disk_str:
+            size_part = disk_str.split('size=')[1].split(',')[0]
+            if size_part.endswith('G'):
+                return int(size_part[:-1])
+            elif size_part.endswith('M'):
+                return int(size_part[:-1]) // 1024
+            elif size_part.endswith('T'):
+                return int(size_part[:-1]) * 1024
+    except:
+        pass
+    return 0
+
+
+def get_vm_mac(vm_config: Dict, net_index: int) -> Optional[str]:
+    """Hole MAC-Adresse aus VM/Container Config für netX"""
+    try:
+        net_key = f'net{net_index}'
+        if net_key not in vm_config:
             return None
         
-        return arp_map.get(mac.lower())
+        net_str = vm_config[net_key]
+        # Format: virtio=MAC,... oder e1000=MAC,...
+        for part in net_str.split(','):
+            if '=' in part:
+                _, mac_candidate = part.split('=', 1)
+                mac_candidate = mac_candidate.strip()
+                if len(mac_candidate) == 17 and mac_candidate.count(':') == 5:
+                    return mac_candidate.lower()
+    except:
+        pass
+    return None
+
+
+def fetch_arp_map() -> Dict[str, str]:
+    """Hole ARP-Tabelle von OPNsense: MAC -> IP"""
+    if not opn_session:
+        return {}
     
-    def log_eth_mapping(
-        self,
-        vm_name: str,
-        vmid: int,
-        is_container: bool,
-        vm_config: Dict,
-        arp_map: Dict[str, str]
-    ) -> None:
-        """Log netX -> ethX mapping with MAC + IP (dry-run)"""
-        prefix = "Ctr" if is_container else "VM"
+    try:
+        url = f"{config['OPNSENSE_URL']}/api/diagnostics/interface/get_arp"
+        r = opn_session.get(url, timeout=10)
+        r.raise_for_status()
         
-        for i in range(4):
-            net_key = f'net{i}'
-            if net_key not in vm_config:
-                continue
-            
-            eth_name = f"eth{i}"
-            mac = self.get_vm_mac(vm_config, i)
-            ip = self.get_ip_from_mac(mac, arp_map) if mac else None
-            
-            logger.info(
-                f"DRY-RUN: {prefix} {vm_name} (VMID {vmid}) "
-                f"{net_key} → {eth_name} | MAC: {mac or 'N/A'} | IP: {ip or 'N/A'}"
-            )
+        data = r.json()
+        rows = data if isinstance(data, list) else data.get('rows', [])
+        
+        arp_map = {}
+        for row in rows:
+            ip = row.get('ip') or row.get('ipaddr')
+            mac = row.get('mac') or row.get('macaddr')
+            if ip and mac:
+                arp_map[mac.lower()] = ip
+        
+        logger.debug(f"OPNsense ARP: {len(arp_map)} Einträge")
+        return arp_map
+    except Exception as e:
+        logger.warning(f"⚠️ OPNsense ARP Error: {e}")
+        return {}
+
+
+def get_ip_from_mac(mac: str, arp_map: Dict[str, str]) -> Optional[str]:
+    """Finde IP-Adresse für MAC-Adresse aus ARP-Tabelle"""
+    if not mac or not arp_map:
+        return None
     
-    def get_proxmox_vms(self, api) -> Tuple[List[Dict], Dict[str, str]]:
-        """Get all VMs and containers from Proxmox"""
-        arp_map = self.fetch_arp_map()
-        vms: List[Dict] = []
+    mac_lower = mac.lower()
+    return arp_map.get(mac_lower)
+
+
+def log_eth_mapping(vm_name: str, vmid: int, is_container: bool, vm_config: Dict, arp_map: Dict[str, str]) -> None:
+    """
+    Dry-Run: logge netX -> ethX Mapping mit MAC + IP
+    Legt noch nichts in NetBox an.
+    """
+    prefix = "Ctr" if is_container else "VM"
+    for i in range(4):  # net0..net3 → eth0..eth3
+        net_key = f'net{i}'
+        if net_key not in vm_config:
+            continue
         
-        try:
-            nodes = api.nodes.get()
-            logger.info(f"Scanning {len(nodes)} nodes...\n")
+        eth_name = f"eth{i}"
+        mac = get_vm_mac(vm_config, i)
+        ip = get_ip_from_mac(mac, arp_map) if mac else None
+        
+        logger.info(
+            f"DRY-RUN: {prefix} {vm_name} (VMID {vmid}) "
+            f"{net_key} → {eth_name} | MAC: {mac or 'N/A'} | IP: {ip or 'N/A'}"
+        )
+
+
+def get_proxmox_vms(api) -> Tuple[List[Dict], Dict[str, str]]:
+    """Hole alle VMs und Container aus Proxmox mit Status und MACs + Dry-Run ethX-Mapping"""
+    arp_map = fetch_arp_map()
+    vms: List[Dict] = []
+    
+    try:
+        nodes = api.nodes.get()
+        logger.info(f"Scanne {len(nodes)} Nodes...\n")
+        
+        for node in nodes:
+            node_name = node['node']
+            logger.info(f" Node: {node_name}")
             
-            for node in nodes:
-                node_name = node['node']
-                logger.info(f" Node: {node_name}")
-                
-                try:
-                    qemu = api.nodes(node_name).qemu.get()
-                except Exception as e:
-                    logger.debug(f"QEmu error: {e}")
-                    qemu = []
-                
+            # ===== QEmu VMs =====
+            try:
+                qemu = api.nodes(node_name).qemu.get()
                 for vm in qemu:
                     try:
                         vm_config = api.nodes(node_name).qemu(vm['vmid']).config.get()
-                        
                         disk_gb = 0
+                        
                         for disk_key in ['virtio0', 'scsi0', 'sata0', 'ide0', 'virtio1', 'scsi1']:
                             if disk_key in vm_config:
-                                disk_gb = self.extract_disk_size(vm_config[disk_key])
+                                disk_gb = extract_disk_size(vm_config[disk_key])
                                 if disk_gb > 0:
                                     break
                         
-                        mac_addr = self.get_vm_mac(vm_config, 0)
-                        ip_addr = self.get_ip_from_mac(mac_addr, arp_map) if mac_addr else None
+                        # Haupt-MAC für Übersicht (net0)
+                        mac_addr = get_vm_mac(vm_config, 0)
+                        ip_addr = get_ip_from_mac(mac_addr, arp_map) if mac_addr else None
                         status = 'active' if vm['status'] == 'running' else 'offline'
                         
                         vm_data = {
@@ -232,29 +218,35 @@ class NetBoxProxmoxSync:
                             f"({vm_data['vcpus']}C, {vm_data['memory_mb']}MB, {disk_gb}GB{mac_str}{ip_str}) [{status}]"
                         )
                         
-                        self.log_eth_mapping(vm['name'], vm['vmid'], False, vm_config, arp_map)
+                        # Dry-Run ethX/MAC/IP Mapping loggen
+                        log_eth_mapping(vm['name'], vm['vmid'], False, vm_config, arp_map)
                     
                     except Exception as e:
                         logger.warning(f" ⚠️ VM {vm.get('name', vm.get('vmid'))}: {e}")
-                
-                try:
-                    lxc_list = api.nodes(node_name).lxc.get()
-                except Exception as e:
-                    logger.debug(f"No LXC: {e}")
-                    lxc_list = []
-                
+            
+            except Exception as e:
+                logger.warning(f" ⚠️ QEmu Error: {e}")
+            
+            # ===== LXC Container =====
+            try:
+                lxc_list = api.nodes(node_name).lxc.get()
+            except Exception as e:
+                logger.debug(f"No LXC: {e}")
+                lxc_list = []
+            
+            if lxc_list:
                 for ct in lxc_list:
                     vmid = ct['vmid']
                     try:
                         ct_config = api.nodes(node_name).lxc(vmid).config.get()
                         ct_name = ct_config.get('hostname', f"ct-{vmid}")
-                        
                         disk_gb = 0
-                        if 'rootfs' in ct_config:
-                            disk_gb = self.extract_disk_size(ct_config['rootfs'])
                         
-                        mac_addr = self.get_vm_mac(ct_config, 0)
-                        ip_addr = self.get_ip_from_mac(mac_addr, arp_map) if mac_addr else None
+                        if 'rootfs' in ct_config:
+                            disk_gb = extract_disk_size(ct_config['rootfs'])
+                        
+                        mac_addr = get_vm_mac(ct_config, 0)
+                        ip_addr = get_ip_from_mac(mac_addr, arp_map) if mac_addr else None
                         status = 'active' if ct['status'] == 'running' else 'offline'
                         
                         ct_data = {
@@ -280,117 +272,184 @@ class NetBoxProxmoxSync:
                             f"({ct_data['vcpus']}C, {ct_data['memory_mb']}MB, {disk_gb}GB{mac_str}{ip_str}) [{status}]"
                         )
                         
-                        self.log_eth_mapping(ct_name, vmid, True, ct_config, arp_map)
+                        # Dry-Run ethX/MAC/IP Mapping loggen
+                        log_eth_mapping(ct_name, vmid, True, ct_config, arp_map)
                     
                     except Exception as e:
                         logger.warning(f" ⚠️ Container {vmid}: {e}")
-        
-        except Exception as e:
-            logger.error(f"❌ Proxmox error: {e}")
-            return [], arp_map
-        
-        logger.info(f"\n✅ Total: {len(vms)} VMs/containers found\n")
-        return vms, arp_map
     
-    def sync(self) -> bool:
-        """Perform synchronization"""
-        logger.info("=" * 70)
-        logger.info(f"Proxmox → NetBox Sync v{__version__}")
-        if self.dry_run:
-            logger.info("🧪 DRY-RUN MODE (no changes)")
-        logger.info("=" * 70 + "\n")
+    except Exception as e:
+        logger.error(f"❌ Error: {e}")
+        return [], arp_map
+    
+    logger.info(f"\n✅ Total: {len(vms)}\n")
+    return vms, arp_map
+
+
+def get_or_create_cluster() -> Optional[int]:
+    """Hole oder erstelle Cluster"""
+    r = session.get(
+        f"{config['NB_URL']}/api/virtualization/clusters/?name={config['CLUSTER_NAME']}",
+        headers={'Authorization': f"Token {config['NB_TOKEN']}"}
+    )
+    
+    if r.status_code == 200 and r.json()['results']:
+        cluster_id = r.json()['results'][0]['id']
+        logger.info(f"✅ Cluster (ID: {cluster_id})\n")
+        return cluster_id
+    
+    logger.info("Create cluster...")
+    r = session.post(
+        f"{config['NB_URL']}/api/virtualization/clusters/",
+        json={'name': config['CLUSTER_NAME'], 'type': 'proxmox'},
+        headers={'Authorization': f"Token {config['NB_TOKEN']}", 'Content-Type': 'application/json'}
+    )
+    
+    if r.status_code in [200, 201]:
+        cluster_id = r.json()['id']
+        logger.info(f"✅ Cluster created (ID: {cluster_id})\n")
+        return cluster_id
+    
+    logger.error(f"❌ Cluster error: {r.status_code}")
+    return None
+
+
+def parse_ports_from_config(ports_str: str) -> List[int]:
+    """
+    Parse port string from config
+    Supports: 22,80,443 or 1-1000,3000-3100 or mixed
+    """
+    ports = []
+    try:
+        for part in ports_str.split(','):
+            part = part.strip()
+            if '-' in part:
+                start, end = part.split('-')
+                ports.extend(range(int(start), int(end) + 1))
+            else:
+                ports.append(int(part))
+        return sorted(list(set(ports)))
+    except Exception as e:
+        logger.warning(f"Failed to parse ports: {e}")
+        return [22, 80, 443]  # Default
+
+
+def integrate_port_scanning(vms: List[Dict]) -> bool:
+    """
+    ✅ PORT SCANNING INTEGRATION (NEW)
+    Scan ports on all VMs and create services in NetBox
+    """
+    if not config['PORT_SCANNING_ENABLED']:
+        logger.info("Port scanning disabled in config\n")
+        return True
+    
+    try:
+        from port_scanning_integration import PortScanningIntegration
+        import pynetbox
         
-        try:
-            api = ProxmoxAPI(
-                host=self.config['PVE_HOST'],
-                user=self.config['PVE_USER'],
-                token_name=self.config['PVE_TOKEN'],
-                token_value=self.config['PVE_SECRET'],
-                verify_ssl=self.config['VERIFY_SSL'],
-            )
-            logger.info(f"✅ Proxmox: {self.config['PVE_HOST']}\n")
-        except Exception as e:
-            logger.error(f"❌ Proxmox connection error: {e}")
-            return False
+        logger.info("🔍 Port Scanning Integration Starting...\n")
         
-        vms, arp_map = self.get_proxmox_vms(api)
-        
-        if not vms:
-            logger.error("❌ No VMs/containers found")
-            return False
-        
-        if self.dry_run:
-            logger.info("\n🧪 DRY-RUN: Exiting without NetBox changes\n")
-            return True
-        
-        cluster_id = get_or_create_cluster(
-            session=self.session,
-            nb_url=self.config['NB_URL'],
-            nb_token=self.config['NB_TOKEN'],
-            cluster_name=self.config['CLUSTER_NAME'],
-            timeout=self.config['REQUEST_TIMEOUT'],
-            retry_count=self.config['RETRY_COUNT'],
+        # Initialize NetBox API
+        netbox_api = pynetbox.api(
+            config['NB_URL'],
+            token=config['NB_TOKEN']
         )
         
-        if not cluster_id:
-            logger.error("❌ Cluster could not be found/created")
-            return False
+        # Parse ports from config
+        ports = parse_ports_from_config(config['PORT_SCANNING_PORTS'])
+        logger.info(f"Will scan {len(ports)} ports: {ports[:10]}...\n")
         
-        logger.info("Synchronizing VMs/containers with NetBox:")
-        logger.info("-" * 70)
-        
-        synced = sum(
-            1 for vm in vms
-            if get_or_create_vm(
-                session=self.session,
-                nb_url=self.config['NB_URL'],
-                nb_token=self.config['NB_TOKEN'],
-                cluster_id=cluster_id,
-                vm=vm,
-                timeout=self.config['REQUEST_TIMEOUT'],
-                retry_count=self.config['RETRY_COUNT'],
-            )
+        # Initialize scanner
+        scanner = PortScanningIntegration(
+            netbox_api=netbox_api,
+            netbox_url=config['NB_URL'],
+            netbox_token=config['NB_TOKEN'],
+            ssl_verify=False,
+            timeout=config['PORT_SCANNING_TIMEOUT']
         )
         
-        logger.info("-" * 70)
-        logger.info(f"\n✅ {synced}/{len(vms)} VMs/containers synchronized\n")
+        # Scan all VMs with IP addresses
+        vms_to_scan = [
+            vm for vm in vms 
+            if vm.get('ip_addr') and vm['status'] == 'active'
+        ]
         
-        if arp_map and self.opn_session:
-            logger.info(f"📊 ARP entries found: {len(arp_map)}\n")
+        logger.info(f"Scanning {len(vms_to_scan)} active VMs with IP addresses...\n")
+        
+        if vms_to_scan:
+            successful = scanner.scan_all_vms_services(vms_to_scan, ports)
+            logger.info(f"✅ Port scanning completed: {successful}/{len(vms_to_scan)} VMs scanned\n")
+        else:
+            logger.warning("No active VMs with IP addresses found for scanning\n")
         
         return True
+    
+    except ImportError:
+        logger.warning("⚠️ Port scanning modules not found. Skipping.\n")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Port scanning failed: {e}\n")
+        return False
 
 
 def main():
-    """Main function"""
-    parser = argparse.ArgumentParser(
-        description="Synchronize Proxmox VMs to NetBox",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
-    parser.add_argument('--dry-run', action='store_true', help='Only log, no changes')
-    parser.add_argument('--no-arp', action='store_true', help='Disable OPNsense ARP lookup')
-    parser.add_argument('--config', type=str, help='Config file path (default: config.ini)')
-    parser.add_argument('--debug', action='store_true', help='Enable debug logging')
+    logger.info("=" * 70)
+    logger.info("Proxmox → NetBox Sync (mit MAC-to-IP via OPNsense ARP + Port Scanning)")
+    logger.info("=" * 70 + "\n")
     
-    args = parser.parse_args()
-    
-    setup_logging(level=logging.DEBUG if args.debug else logging.INFO)
-    
-    config = load_config(args.config)
-    
-    if not validate_config(config):
-        logger.error("❌ Configuration invalid - please check the values")
+    try:
+        api = ProxmoxAPI(
+            host=config['PVE_HOST'],
+            user=config['PVE_USER'],
+            token_name=config['PVE_TOKEN'],
+            token_value=config['PVE_SECRET'],
+            verify_ssl=False,
+        )
+        logger.info(f"✅ Proxmox: {config['PVE_HOST']}\n")
+    except Exception as e:
+        logger.error(f"❌ Proxmox error: {e}")
         sys.exit(1)
     
-    syncer = NetBoxProxmoxSync(
-        config=config,
-        dry_run=args.dry_run,
-        use_arp=not args.no_arp
+    vms, arp_map = get_proxmox_vms(api)
+    
+    if not vms:
+        logger.error("❌ No VMs found")
+        sys.exit(1)
+    
+    cluster_id = get_or_create_cluster()
+    if not cluster_id:
+        sys.exit(1)
+    
+    logger.info("Sync (nur VMs, kein Interface/IP-Link, DRY-RUN für ethX):")
+    logger.info("-" * 70)
+    
+    synced = sum(
+        1 for vm in vms
+        if get_or_create_vm(
+            session=session,
+            nb_url=config["NB_URL"],
+            nb_token=config["NB_TOKEN"],
+            cluster_id=cluster_id,
+            vm=vm,
+        )
     )
     
-    success = syncer.sync()
-    sys.exit(0 if success else 1)
+    logger.info("-" * 70)
+    logger.info(f"\n✅ {synced}/{len(vms)} synchronized\n")
+    
+    if arp_map:
+        logger.info(f"📊 ARP-Einträge gefunden: {len(arp_map)}\n")
+    
+    # ✅ PORT SCANNING INTEGRATION (NEW)
+    logger.info("=" * 70)
+    logger.info("Starting Port Scanning Integration...")
+    logger.info("=" * 70 + "\n")
+    
+    integrate_port_scanning(vms)
+    
+    logger.info("=" * 70)
+    logger.info("✅ All synchronization tasks completed!")
+    logger.info("=" * 70)
 
 
 if __name__ == '__main__':
