@@ -432,35 +432,27 @@ def show_help():
 USAGE:
     python netbox-sync.py [COMMAND]
 
-COMMANDS:
-    all                 Run all features (default)
-                        - VMs sync
-                        - Port scanning
-                        - Network scanning
+COMMANDS (multiple formats supported):
+    all                         Run all features (default)
     
-    vms                 Sync Proxmox VMs/Containers to NetBox only
-                        - Does NOT run port scanning
-                        - Does NOT run network scanning
+    vms, vm-sync, --vm-sync     Sync Proxmox VMs/Containers to NetBox only
     
-    ports               Port scanning on VMs only
-                        - Requires: VMs must be in NetBox first
-                        - Scans open ports on VM IPs
-                        - Creates services in NetBox
+    ports, port-scan, --ports   Port scanning on VMs only
     
-    network             Network scanning and device discovery only
-                        - Does NOT sync VMs
-                        - Scans networks for hosts
-                        - Creates devices automatically
-                        - Includes duplicate prevention
+    network, network-scan, --network-scan
+                                Network scanning and device discovery only
     
-    help                Show this help message
+    help, -h, --help            Show this help message
 
 EXAMPLES:
-    $ python netbox-sync.py                # Run everything
-    $ python netbox-sync.py vms            # Sync VMs only
-    $ python netbox-sync.py ports          # Scan ports only
-    $ python netbox-sync.py network        # Scan networks only
-    $ python netbox-sync.py help           # Show this help
+    $ python netbox-sync.py                  # Run everything
+    $ python netbox-sync.py vms              # Sync VMs only
+    $ python netbox-sync.py --vm-sync        # Sync VMs (flag format)
+    $ python netbox-sync.py ports            # Scan ports only
+    $ python netbox-sync.py --port-scan      # Scan ports (flag format)
+    $ python netbox-sync.py network          # Scan networks only
+    $ python netbox-sync.py --network-scan   # Scan networks (flag format)
+    $ python netbox-sync.py help             # Show this help
 
 SCHEDULING:
     # Hourly (all features)
@@ -478,13 +470,27 @@ SCHEDULING:
 def main():
     """Main synchronization workflow"""
     
-    # Parse command-line arguments
+    # Parse command-line arguments (support both positional and flag formats)
     command = 'all'
     if len(sys.argv) > 1:
         command = sys.argv[1].lower()
+        
+        # Normalize common flag formats (remove -- or - prefix)
+        if command.startswith('--'):
+            command = command[2:]
+        elif command.startswith('-') and command not in ['-h']:
+            command = command[1:]
+        
+        # Handle common variations
+        if command in ['network-scan', 'network_scan', 'networkscan']:
+            command = 'network'
+        elif command in ['port-scan', 'port_scan', 'portscan']:
+            command = 'ports'
+        elif command in ['vm-sync', 'vm_sync', 'vmsync']:
+            command = 'vms'
     
     # Show help if requested
-    if command in ['help', '-h', '--help', '?']:
+    if command in ['help', 'h', '?']:
         show_help()
         return
     
