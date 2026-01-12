@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-NetBox ↔ Proxmox Sync - Synchronize Proxmox VMs/Containers to NetBox
+NetBox ↔ Proxmox Sync - v1.2.1 MODULAR - Infrastructure Synchronization
 
 Features:
 - Automatic VM and container synchronization
@@ -10,6 +10,7 @@ Features:
 - Optional network scanning and discovery with NetBox device creation
 - Automatic duplicate prevention (device name & IP address checks)
 - Comprehensive logging with emoji status indicators
+- MODULAR CLI: Run individual features separately
 """
 
 import sys
@@ -399,10 +400,6 @@ def integrate_network_scanning(ports: List[int]) -> bool:
         
         networks = [n.strip() for n in config['NETWORK_SCANNING_NETWORKS'].split(',') if n.strip()]
         
-        # Initialize with NetBox credentials for automatic device creation
-        # NOTE: nb_discovered_hosts.py handles duplicate prevention automatically
-        # - Checks by device name
-        # - Checks by IP address in IPAM
         scanner = NetworkScanningIntegration(
             timeout=config['NETWORK_SCANNING_TIMEOUT'],
             max_threads=config['NETWORK_SCANNING_THREADS'],
@@ -410,8 +407,6 @@ def integrate_network_scanning(ports: List[int]) -> bool:
             netbox_token=config['NB_TOKEN']
         )
         
-        # Scan networks AND create devices in NetBox automatically
-        # Duplicate prevention: checks by device name and IP address
         created = scanner.scan_and_create_devices(networks, ports)
         
         logger.info(f"✅ Network scanning completed: {created} devices created/updated in NetBox\n")
@@ -427,11 +422,76 @@ def integrate_network_scanning(ports: List[int]) -> bool:
         return False
 
 
+def show_help():
+    """Show help message"""
+    help_text = """
+╔════════════════════════════════════════════════════════════════════════════╗
+║         NetBox Proxmox Sync v1.2.1 - Infrastructure Synchronization        ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+USAGE:
+    python netbox-sync.py [COMMAND]
+
+COMMANDS:
+    all                 Run all features (default)
+                        - VMs sync
+                        - Port scanning
+                        - Network scanning
+    
+    vms                 Sync Proxmox VMs/Containers to NetBox only
+                        - Does NOT run port scanning
+                        - Does NOT run network scanning
+    
+    ports               Port scanning on VMs only
+                        - Requires: VMs must be in NetBox first
+                        - Scans open ports on VM IPs
+                        - Creates services in NetBox
+    
+    network             Network scanning and device discovery only
+                        - Does NOT sync VMs
+                        - Scans networks for hosts
+                        - Creates devices automatically
+                        - Includes duplicate prevention
+    
+    help                Show this help message
+
+EXAMPLES:
+    $ python netbox-sync.py                # Run everything
+    $ python netbox-sync.py vms            # Sync VMs only
+    $ python netbox-sync.py ports          # Scan ports only
+    $ python netbox-sync.py network        # Scan networks only
+    $ python netbox-sync.py help           # Show this help
+
+SCHEDULING:
+    # Hourly (all features)
+    0 * * * * python netbox-sync.py >> /var/log/netbox-sync.log 2>&1
+    
+    # Only VMs hourly, Network every 30 min
+    0 * * * * python netbox-sync.py vms >> /var/log/netbox-sync-vms.log 2>&1
+    */30 * * * * python netbox-sync.py network >> /var/log/netbox-sync-network.log 2>&1
+
+════════════════════════════════════════════════════════════════════════════════
+"""
+    print(help_text)
+
+
 def main():
     """Main synchronization workflow"""
     
+    # Parse command-line arguments
+    command = 'all'
+    if len(sys.argv) > 1:
+        command = sys.argv[1].lower()
+    
+    # Show help if requested
+    if command in ['help', '-h', '--help', '?']:
+        show_help()
+        return
+    
     logger.info("=" * 70)
-    logger.info("NetBox Proxmox Sync - Infrastructure Synchronization v1.2.0")
+    logger.info("NetBox Proxmox Sync - Infrastructure Synchronization v1.2.1")
+    if command != 'all':
+        logger.info(f"Mode: {command.upper()}")
     logger.info("=" * 70 + "\n")
     
     # Connect to Proxmox
@@ -448,46 +508,92 @@ def main():
         logger.error(f"❌ Proxmox error: {e}")
         sys.exit(1)
     
-    # Get VMs from Proxmox
-    vms = get_proxmox_vms(api)
+    # Get VMs from Proxmox (needed for ports, optional for all/network)
+    vms = None
+    if command in ['all', 'vms', 'ports']:
+        vms = get_proxmox_vms(api)
+        
+        if not vms:
+            logger.error("❌ No VMs found")
+            sys.exit(1)
     
-    if not vms:
-        logger.error("❌ No VMs found")
-        sys.exit(1)
-    
-    # Get or create cluster
-    cluster_id = get_or_create_cluster()
-    if not cluster_id:
-        sys.exit(1)
-    
-    # Sync VMs to NetBox
-    logger.info("Syncing VMs/Containers:")
-    logger.info("-" * 70)
-    
-    synced = sum(
-        1 for vm in vms
-        if get_or_create_vm(
-            session=session,
-            nb_url=config["NB_URL"],
-            nb_token=config["NB_TOKEN"],
-            cluster_id=cluster_id,
-            vm=vm,
+    # Execute based on command
+    if command == 'all':
+        # ===== ALL: VMs + Ports + Network =====
+        
+        # Get or create cluster
+        cluster_id = get_or_create_cluster()
+        if not cluster_id:
+            sys.exit(1)
+        
+        # Sync VMs to NetBox
+        logger.info("Syncing VMs/Containers:")
+        logger.info("-" * 70)
+        
+        synced = sum(
+            1 for vm in vms
+            if get_or_create_vm(
+                session=session,
+                nb_url=config["NB_URL"],
+                nb_token=config["NB_TOKEN"],
+                cluster_id=cluster_id,
+                vm=vm,
+            )
         )
-    )
+        
+        logger.info("-" * 70)
+        logger.info(f"\n✅ {synced}/{len(vms)} VMs synchronized\n")
+        
+        # Port scanning
+        port_list = parse_ports_from_string(config['PORT_SCANNING_PORTS'])
+        integrate_port_scanning(vms)
+        
+        # Network scanning
+        network_port_list = parse_ports_from_string(config['NETWORK_SCANNING_PORTS'])
+        integrate_network_scanning(network_port_list)
     
-    logger.info("-" * 70)
-    logger.info(f"\n✅ {synced}/{len(vms)} VMs synchronized\n")
+    elif command == 'vms':
+        # ===== VMS ONLY =====
+        
+        # Get or create cluster
+        cluster_id = get_or_create_cluster()
+        if not cluster_id:
+            sys.exit(1)
+        
+        # Sync VMs to NetBox
+        logger.info("Syncing VMs/Containers:")
+        logger.info("-" * 70)
+        
+        synced = sum(
+            1 for vm in vms
+            if get_or_create_vm(
+                session=session,
+                nb_url=config["NB_URL"],
+                nb_token=config["NB_TOKEN"],
+                cluster_id=cluster_id,
+                vm=vm,
+            )
+        )
+        
+        logger.info("-" * 70)
+        logger.info(f"\n✅ {synced}/{len(vms)} VMs synchronized\n")
     
-    # Parse ports for scanning features
-    port_list = parse_ports_from_string(config['PORT_SCANNING_PORTS'])
-    network_port_list = parse_ports_from_string(config['NETWORK_SCANNING_PORTS'])
+    elif command == 'ports':
+        # ===== PORTS ONLY =====
+        
+        port_list = parse_ports_from_string(config['PORT_SCANNING_PORTS'])
+        integrate_port_scanning(vms)
     
-    # Optional: Port scanning on known VMs
-    integrate_port_scanning(vms)
+    elif command == 'network':
+        # ===== NETWORK ONLY =====
+        
+        network_port_list = parse_ports_from_string(config['NETWORK_SCANNING_PORTS'])
+        integrate_network_scanning(network_port_list)
     
-    # Optional: Network scanning and discovery with NetBox device creation
-    # ✅ Includes duplicate prevention (name & IP checks)
-    integrate_network_scanning(network_port_list)
+    else:
+        logger.error(f"❌ Unknown command: {command}")
+        logger.info("Use 'python netbox-sync.py help' for available commands")
+        sys.exit(1)
     
     logger.info("=" * 70)
     logger.info("✅ All synchronization tasks completed!")
