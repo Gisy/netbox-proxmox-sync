@@ -1,46 +1,105 @@
-# NetBox Proxmox Sync Configuration
-# Syncs Proxmox VMs and Containers to NetBox with optional port scanning
+# NetBox Proxmox Sync - Configuration Template
+# Copy to config.ini and adjust values for your environment
 
 [proxmox]
-# Proxmox API credentials
-pve_host = pve.example.com
-pve_user = sync@pam
-pve_password = your_password
-pve_verify_ssl = False
+# Proxmox VE host
+host = pve.example.com
 
-# NetBox site name for Proxmox cluster
+# Proxmox user (typically sync@pam)
+user = sync@pam
+
+# API Token name
+token = token-name
+
+# API Token secret
+secret = token-secret
+
+# Verify SSL certificate
+verify_ssl = False
+
+# NetBox site name (matching Proxmox cluster name)
 netbox_site = Datacenter
 
 [netbox]
-# NetBox API credentials
+# NetBox URL
 url = https://netbox.example.com
-token = your_api_token_here
+
+# NetBox API token
+token = your_api_token
+
+# Cluster name in NetBox
+cluster_name = Proxmox-Cluster
+
+# Verify SSL certificate
 ssl_verify = True
 
-[sync]
-# Synchronization options
-enabled = True
-# Interval in seconds (3600 = 1 hour)
-interval = 3600
-# Dry run mode (log changes without applying them)
-dry_run = False
+[opnsense]
+# OPNsense URL (optional, for ARP lookups)
+url = https://opnsense.example.com
+
+# OPNsense API key
+key = your_api_key
+
+# OPNsense API secret
+secret = your_api_secret
 
 [port_scanning]
-# Port scanning feature - auto-detect open ports and add as services
+# Port scanning feature - auto-detect open ports on VMs
 enabled = False
-# Ports to scan (comma-separated, ranges with dash, e.g. "22,80,443,3000-3100,8080-8090")
+
+# Ports to scan (comma-separated, supports ranges)
+# Examples: 22,80,443 or 22,80,443,3000-3100,8000-9000
 ports_to_scan = 22,80,443,3306,5432,8080,8443
+
 # Socket timeout per port in seconds
 timeout = 5
-# Max parallel threads for scanning
+
+# Maximum parallel scanning threads
 max_threads = 20
+
+[network_scanning]
+# Network scanning feature - discover and scan entire networks/subnets
+enabled = False
+
+# Networks to scan (comma-separated)
+# Formats supported:
+#   CIDR notation: 192.168.1.0/24, 10.0.0.0/8, 172.16.0.0/16
+#   IP ranges: 192.168.1.1-192.168.1.254, 10.0.0.1-10.0.0.50
+#   Single hosts: 192.168.1.100
+# Examples:
+#   networks_to_scan = 192.168.1.0/24
+#   networks_to_scan = 192.168.1.0/24,10.0.0.0/8
+#   networks_to_scan = 192.168.1.1-192.168.1.254,10.0.0.100
+networks_to_scan = 192.168.1.0/24
+
+# Ports to scan on discovered hosts (comma-separated, supports ranges)
+ports_to_scan = 22,80,443,3306,5432,8080
+
+# Socket timeout for host/port scan in seconds
+timeout = 2
+
+# Maximum parallel scanning threads
+max_threads = 50
 
 [logging]
 # Log level: DEBUG, INFO, WARNING, ERROR
 level = INFO
+
 # Log file path (leave empty for console only)
 file = netbox-sync.log
-# Max log file size in MB
+
+# Maximum log file size in MB
 max_size = 10
-# Number of backup log files
+
+# Number of backup log files to keep
 backup_count = 5
+
+[sync]
+# Enable synchronization
+enabled = True
+
+# Sync interval in seconds (for continuous sync)
+interval = 3600
+
+# Dry-run mode (log changes without making them)
+dry_run = False

@@ -1,12 +1,13 @@
 # NetBox Proxmox Sync
 
-**Intelligent synchronization of Proxmox VMs and containers to NetBox DCIM with optional port scanning.**
+**Intelligent synchronization of Proxmox VMs and containers to NetBox DCIM with optional port scanning and network discovery.**
 
 Automatically syncs your Proxmox infrastructure to NetBox with:
 - ✅ VM and container data
 - ✅ MAC address detection
 - ✅ IP address lookup
 - ✅ **Open port detection** (optional)
+- ✅ **Network discovery and scanning** (optional)
 - ✅ Service management
 
 ## Features
@@ -18,12 +19,21 @@ Automatically syncs your Proxmox infrastructure to NetBox with:
 - **Status Management** - Tracks VM status (running, stopped, suspended)
 - **Interface Tracking** - Monitors network interfaces and their status
 
-### Port Scanning (NEW!)
+### Port Scanning (Optional)
 - **Socket-Based Scanning** - Lightweight TCP port scanning without external tools
 - **Multi-Threading** - Scan multiple ports and hosts in parallel (20 threads default)
 - **Auto Service Creation** - Automatically create services in NetBox for open ports
 - **Configurable Ports** - Scan specific ports or ranges (22, 80, 443, 3000-3100, etc.)
 - **Smart Service Names** - Auto-map ports to service names (SSH, HTTP, MySQL, etc.)
+
+### Network Scanning (NEW!)
+- **Network Discovery** - Scan entire networks/subnets (CIDR or IP ranges)
+- **Host Discovery** - Find active hosts using TCP health checks
+- **Parallel Scanning** - Multi-threaded discovery and scanning (50 threads default)
+- **CIDR Support** - `192.168.1.0/24`, `10.0.0.0/8`, etc.
+- **IP Ranges** - `192.168.1.1-192.168.1.254`
+- **Automatic Sampling** - Smart sampling for large networks
+- **Hostname Resolution** - Auto-resolve hostnames from IP addresses
 
 ## Quick Start
 
@@ -33,6 +43,10 @@ Automatically syncs your Proxmox infrastructure to NetBox with:
 # Clone repository
 git clone https://github.com/Gisy/netbox-proxmox-sync.git
 cd netbox-proxmox-sync
+
+# Create virtual environment
+python3 -m venv venv
+source venv/bin/activate
 
 # Install dependencies
 pip install -r requirements.txt
@@ -48,19 +62,36 @@ nano config.ini
 
 ```ini
 [proxmox]
-pve_host = pve.example.com
-pve_user = sync@pam
-pve_password = your_password
-pve_verify_ssl = False
+host = pve.example.com
+user = sync@pam
+token = your_token_name
+secret = your_token_secret
+verify_ssl = False
 netbox_site = Datacenter
 
 [netbox]
 url = https://netbox.example.com
 token = your_api_token
+cluster_name = Proxmox-Cluster
 ssl_verify = True
+
+[opnsense]
+url = https://opnsense.example.com
+key = your_api_key
+secret = your_api_secret
 
 [port_scanning]
 enabled = False
+ports_to_scan = 22,80,443
+timeout = 5
+max_threads = 20
+
+[network_scanning]
+enabled = False
+networks_to_scan = 192.168.1.0/24
+ports_to_scan = 22,80,443
+timeout = 2
+max_threads = 50
 ```
 
 ### Run Synchronization
@@ -72,15 +103,15 @@ python netbox-sync.py
 # With port scanning
 python netbox-sync.py --scan
 
-# Specific ports
-python netbox-sync.py --scan --ports 22,80,443
+# With network scanning
+python netbox-sync.py --network-scan
 ```
 
-## Port Scanning Feature
+## Scanning Features
 
-Automatically detect open ports and create services in NetBox!
+### Port Scanning (VMs)
 
-### Enable Port Scanning
+Scan open ports on known VMs:
 
 ```ini
 [port_scanning]
@@ -90,56 +121,27 @@ timeout = 5
 max_threads = 20
 ```
 
-### Usage Examples
-
-```bash
-# Scan with config defaults
-python netbox-sync.py --scan
-
-# Scan specific ports
-python netbox-sync.py --scan --ports 22,80,443,3000-3100
-
-# Custom timeout
-python netbox-sync.py --scan --timeout 10
-
-# Full sync + scanning
-python netbox-sync.py
-```
-
-### Service Creation
-
-Detected ports are created in NetBox as **Services**:
-
-```
-Service: auto-tcp-22
-├── Protocol: TCP
-├── Port: 22
-├── Description: SSH - Auto-detected
-└── Linked to: IP Address
-
-Service: auto-tcp-80
-├── Protocol: TCP
-├── Port: 80
-├── Description: HTTP - Auto-detected
-└── Linked to: IP Address
-```
-
-### Port Mapping
-
-Common ports are automatically mapped to service names:
-
-| Port | Service | Port | Service |
-|------|---------|------|---------|
-| 22 | SSH | 3306 | MySQL |
-| 80 | HTTP | 5432 | PostgreSQL |
-| 443 | HTTPS | 8080 | HTTP-Proxy |
-| 25 | SMTP | 9200 | Elasticsearch |
-| 53 | DNS | 6379 | Redis |
-| 110 | POP3 | 5900 | VNC |
-| 143 | IMAP | 3389 | RDP |
-| 445 | SMB | 27017 | MongoDB |
-
 See [PORT_SCANNING.md](PORT_SCANNING.md) for complete documentation.
+
+### Network Scanning
+
+Discover and scan entire networks:
+
+```ini
+[network_scanning]
+enabled = True
+networks_to_scan = 192.168.1.0/24,10.0.0.0/8
+ports_to_scan = 22,80,443,3306,5432,8080
+timeout = 2
+max_threads = 50
+```
+
+**Supported formats:**
+- CIDR: `192.168.1.0/24`, `10.0.0.0/8`
+- IP Range: `192.168.1.1-192.168.1.254`
+- Single Host: `192.168.1.100`
+
+See [NETWORK_SCANNING.md](NETWORK_SCANNING.md) for complete documentation.
 
 ## Architecture
 
@@ -150,8 +152,11 @@ netbox-sync.py (Main Script)
     ├── nb_vm.py (VM Management)
     ├── nb_interfaces.py (Network Interfaces)
     ├── nb_ip.py (IP Addresses)
-    ├── nb_services.py (Services/Ports) [NEW]
-    ├── port_scanner.py (Port Scanning) [NEW]
+    ├── nb_services.py (Services/Ports)
+    ├── port_scanner.py (Port Scanning)
+    ├── port_scanning_integration.py (Port Scan Integration)
+    ├── network_scanner.py (Network Scanning) [NEW]
+    ├── network_scanning_integration.py (Network Scan Integration) [NEW]
     └── common.py (Utilities)
     ↓
 NetBox DCIM
@@ -167,10 +172,14 @@ NetBox DCIM
 - `nb_interfaces.py` - Network interface management
 - `nb_ip.py` - IP address management
 
-### Port Scanning (NEW)
+### Port Scanning
 - `port_scanner.py` - Socket-based port scanning with threading
 - `nb_services.py` - NetBox service management
 - `port_scanning_integration.py` - Integration with main sync
+
+### Network Scanning (NEW)
+- `network_scanner.py` - Network discovery and scanning
+- `network_scanning_integration.py` - Integration with main sync
 
 ### Configuration & Documentation
 - `config.ini.example` - Configuration template
@@ -179,6 +188,7 @@ NetBox DCIM
 - `INSTALL.md` - Installation guide
 - `QUICK-REFERENCE.md` - CLI reference
 - `PORT_SCANNING.md` - Port scanning guide
+- `NETWORK_SCANNING.md` - Network scanning guide
 - `CHANGELOG.md` - Version history
 
 ## CLI Commands
@@ -204,9 +214,16 @@ python netbox-sync.py --scan
 
 # Scan specific ports
 python netbox-sync.py --scan --ports 22,80,443
+```
 
-# Custom timeout
-python netbox-sync.py --scan --timeout 10
+### Network Scanning
+
+```bash
+# Scan networks from config
+python netbox-sync.py --network-scan
+
+# Scan specific networks
+python netbox-sync.py --network-scan --networks 192.168.1.0/24,10.0.0.0/8
 ```
 
 ### Testing
@@ -239,46 +256,6 @@ See [QUICK-REFERENCE.md](QUICK-REFERENCE.md) for complete command reference.
 
 ## Configuration
 
-### Basic Setup
-
-1. Copy `config.ini.example` to `config.ini`
-2. Set Proxmox credentials and URL
-3. Set NetBox URL and API token
-4. Set NetBox site name matching your Proxmox cluster location
-
-### Advanced Options
-
-```ini
-[proxmox]
-pve_host = pve.example.com
-pve_user = sync@pam
-pve_password = your_password
-pve_verify_ssl = False
-netbox_site = Datacenter
-
-[netbox]
-url = https://netbox.example.com
-token = your_api_token
-ssl_verify = True
-
-[sync]
-enabled = True
-interval = 3600
-dry_run = False
-
-[port_scanning]
-enabled = False
-ports_to_scan = 22,80,443,3306,5432,8080-8090
-timeout = 5
-max_threads = 20
-
-[logging]
-level = INFO
-file = netbox-sync.log
-max_size = 10
-backup_count = 5
-```
-
 See [INSTALL.md](INSTALL.md) for detailed setup instructions.
 
 ## Performance
@@ -292,6 +269,12 @@ See [INSTALL.md](INSTALL.md) for detailed setup instructions.
 - **Per Host**: ~2 minutes for 50 ports with 20 threads, 5s timeout
 - **Multiple Hosts**: Scanned in parallel
 - **Memory**: ~50 MB for 20 concurrent threads
+
+### Network Scanning
+- **Host Discovery**: Depends on network size and thread count
+- **/24 Network**: ~5-10 minutes for full scan (50 threads)
+- **/16 Network**: Sampled (~100 hosts), ~5 minutes
+- **Memory**: ~100 MB for 50 concurrent threads
 
 ## Requirements
 
@@ -308,6 +291,8 @@ proxmoxer >= 1.3.0
 pynetbox >= 7.0.0
 python-dotenv >= 0.20.0
 configparser >= 5.3.0
+urllib3 >= 1.26.0
+certifi >= 2022.0.0
 ```
 
 Install with:
@@ -354,15 +339,18 @@ netbox-proxmox-sync/
 ├── nb_vm.py                 # VM management
 ├── nb_interfaces.py         # Interface management
 ├── nb_ip.py                 # IP management
-├── nb_services.py           # Service management [NEW]
-├── port_scanner.py          # Port scanning [NEW]
-├── port_scanning_integration.py  # Integration [NEW]
+├── nb_services.py           # Service management
+├── port_scanner.py          # Port scanning
+├── port_scanning_integration.py  # Port scan integration
+├── network_scanner.py       # Network scanning [NEW]
+├── network_scanning_integration.py  # Network scan integration [NEW]
 ├── config.ini.example       # Config template
 ├── requirements.txt         # Dependencies
 ├── README.md                # This file
 ├── INSTALL.md               # Installation guide
 ├── QUICK-REFERENCE.md       # CLI reference
 ├── PORT_SCANNING.md         # Port scanning guide
+├── NETWORK_SCANNING.md      # Network scanning guide
 ├── CHANGELOG.md             # Version history
 └── .gitignore               # Git ignore rules
 ```
@@ -390,13 +378,20 @@ MIT License - See LICENSE file for details
 
 ## Support
 
-- **Documentation**: [INSTALL.md](INSTALL.md) | [QUICK-REFERENCE.md](QUICK-REFERENCE.md) | [PORT_SCANNING.md](PORT_SCANNING.md)
+- **Documentation**: [INSTALL.md](INSTALL.md) | [QUICK-REFERENCE.md](QUICK-REFERENCE.md) | [PORT_SCANNING.md](PORT_SCANNING.md) | [NETWORK_SCANNING.md](NETWORK_SCANNING.md)
 - **Issues**: https://github.com/Gisy/netbox-proxmox-sync/issues
 - **Discussions**: https://github.com/Gisy/netbox-proxmox-sync/discussions
 
 ## Version
 
-**1.0.0** - 2026-01-12
+**1.2.0** - 2026-01-12
+
+### Latest Changes
+
+- Network scanning with CIDR and IP range support
+- Host discovery with TCP health checks
+- Automatic hostname resolution
+- Smart network sampling for large subnets
 
 ### Changelog
 
